@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# claude-renamed — list, resume, rename, and unrename Claude Code sessions.
+#
+# Data source: scans ~/.claude/projects/**/*.jsonl for `type:"custom-title"`
+# entries (Claude Code's own session-title format), which is authoritative.
+#
+# Optional path remapping for sessions whose `cwd` no longer exists on this
+# machine (e.g. you moved your code from /srv/ on a Linux box to
+# /Volumes/ssd/srv/ on a Mac). Config file:
+#
+#   ~/.config/claude-renamed/paths.json
+#   {
+#     "prefix_maps": [
+#       {"from": "/old/prefix/", "to": "/new/prefix/"}
+#     ],
+#     "exact_maps": {
+#       "/old/exact/path": "/new/exact/path"
+#     }
+#   }
+#
+# License: MIT. See https://github.com/TuringTzu/claude-renamed
+
+set -euo pipefail
+
+PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+CONFIG_FILE="${CLAUDE_RENAMED_CONFIG:-$HOME/.config/claude-renamed/paths.json}"
+
+if [[ ! -d "$PROJECTS_DIR" ]]; then
+  echo "No projects directory found at $PROJECTS_DIR"
+  echo "Set CLAUDE_PROJECTS_DIR if your sessions live elsewhere."
+  exit 1
+fi
+
+# ── Collect renamed sessions from JSONL files ──────────────────────────────
+collect_sessions() {
+  find "$PROJECTS_DIR" -name '*.jsonl' -not -path '*/subagents/*' -not -path '*/tool-results/*' -not -path '*/workflows/*' | \
+  CLAUDE_RENAMED_CONFIG="$CONFIG_FILE" python3 -c "
+import json, sys, os
+
+# Load optional path-remapping config
+config_file = os.environ.get('CLAUDE_RENAMED_CONFIG', '')
+PREFIX_MAPS = []
+EXACT_MAPS = {}
+if config_file and os.path.exists(config_file):
+    try:
+        with open(config_file) as cf:
+            cfg = json.load(cf)
+        for pm in cfg.get('prefix_maps', []) or []:
+            f = pm.get('from'); t = pm.get('to')
+            if f and t:
+                PREFIX_MAPS.append((f, t))
+        em = cfg.get('exact_maps', {}) or {}
+        if isinstance(em, dict):
+            EXACT_MAPS = {str(k): str(v) for k, v in em.items()}
+    except Exception:
+        pass  # silently ignore malformed config
+
+sessions = {}
+for filepath in sys.stdin:
+    filepath = filepath.strip()
+    if not filepath:
+        continue
+    sid = os.path.basename(filepath).replace('.jsonl', '')
+    if '/' in sid:
+        continue
+
+    title = None
+    first_ts = None
+    last_ts = None
+    project_dir = os.path.basename(os.path.dirname(filepath))
+
+    try:
+        with open(filepath) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get('type') == 'custom-title' and d.get('customTitle'):
+                    title = d['customTitle']
+                ts = d.get('timestamp')
+                if ts:
+                    if isinstance(ts, str):
+                        from datetime import datetime as _dt
+                        try:
+                            ts = int(_dt.fromisoformat(ts.replace('Z','+00:00')).timestamp() * 1000)
+                        except Exception:
+                            continue
+                    if first_ts is None or ts < first_ts:
+                        first_ts = ts
+                    if last_ts is None or ts > last_ts:
+                        last_ts = ts
+    except Exception:
+        continue
+
+    if title and sid not in sessions:
+        # The project_dir encoding is lossy (all / and - become -).
+        # Try to read the actual cwd from the first user message in the session.
+        proj_path = None
+        try:
+            with open(filepath) as f2:
+                for line2 in f2:
+                    try:
+                        d2 = json.loads(line2)
+                        if d2.get('type') == 'user' and d2.get('cwd'):
+                            proj_path = d2['cwd']
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        if not proj_path:
+            proj_path = project_dir
+
+        # Apply optional remapping
+        if proj_path in EXACT_MAPS:
+            proj_path = EXACT_MAPS[proj_path]
+        else:
+            for old_prefix, new_prefix in PREFIX_MAPS:
+                if proj_path == old_prefix.rstrip('/'):
+                    proj_path = new_prefix.rstrip('/')
+                    break
+                if proj_path.startswith(old_prefix):
+                    proj_path = new_prefix + proj_path[len(old_prefix):]
+                    break
+
+        sessions[sid] = {
+            'title': title,
+            'project_dir': project_dir,
+            'project_path': proj_path,
+            'first_ts': first_ts,
+            'last_ts': last_ts,
+            'filepath': filepath,
+        }
+
+from datetime import datetime
+for sid, info in sorted(sessions.items(), key=lambda x: x[1]['last_ts'] or 0, reverse=True):
+    last = datetime.fromtimestamp(info['last_ts'] / 1000).strftime('%Y-%m-%d %H:%M') if info['last_ts'] else '?'
+    print(f\"{info['title']}\t{info['project_path']}\t{last}\t{sid}\t{info['filepath']}\t{info['project_dir']}\")
+"
+}
+
+# ── Remove custom-title lines from a session JSONL ────────────────────────
+unrename_session() {
+  local filepath="$1"
+  python3 -c "
+import sys, json, tempfile, os
+
+filepath = sys.argv[1]
+lines_kept = []
+removed = 0
+with open(filepath) as f:
+    for line in f:
+        try:
+            d = json.loads(line)
+            if d.get('type') == 'custom-title':
+                removed += 1
+                continue
+        except Exception:
+            pass
+        lines_kept.append(line)
+
+if removed == 0:
+    print('No custom-title entries found.')
+    sys.exit(0)
+
+tmpfd, tmppath = tempfile.mkstemp(dir=os.path.dirname(filepath))
+with os.fdopen(tmpfd, 'w') as tmp:
+    for line in lines_kept:
+        tmp.write(line)
+os.replace(tmppath, filepath)
+print(f'Removed {removed} custom-title entries.')
+" "$filepath"
+}
+
+# ── Update custom-title in a session JSONL ─────────────────────────────────
+rename_session() {
+  local filepath="$1"
+  local new_name="$2"
+  python3 -c "
+import sys, json, tempfile, os, time
+
+filepath = sys.argv[1]
+new_name = sys.argv[2]
+
+lines = []
+has_title = False
+with open(filepath) as f:
+    for line in f:
+        try:
+            d = json.loads(line)
+            if d.get('type') == 'custom-title':
+                d['customTitle'] = new_name
+                has_title = True
+                lines.append(json.dumps(d, ensure_ascii=False) + '\n')
+                continue
+        except Exception:
+            pass
+        lines.append(line)
+
+if not has_title:
+    entry = {
+        'type': 'custom-title',
+        'customTitle': new_name,
+        'timestamp': int(time.time() * 1000),
+    }
+    lines.append(json.dumps(entry, ensure_ascii=False) + '\n')
+
+tmpfd, tmppath = tempfile.mkstemp(dir=os.path.dirname(filepath))
+with os.fdopen(tmpfd, 'w') as tmp:
+    for line in lines:
+        tmp.write(line)
+os.replace(tmppath, filepath)
+print(f'Renamed to: {new_name}')
+" "$filepath" "$new_name"
+}
+
+# ── Display list ───────────────────────────────────────────────────────────
+show_list() {
+  echo ""
+  echo "  Claude Session Manager (${#lines[@]} named sessions)"
+  echo "  ──────────────────────────────────────────────────"
+  echo ""
+
+  for i in "${!lines[@]}"; do
+    IFS=$'\t' read -r title project_path last_ts sid filepath project_dir <<< "${lines[$i]}"
+    printf "  \033[1;36m%2d\033[0m  \033[1m%-35s\033[0m  \033[2m%-40s  %s\033[0m\n" \
+      $((i + 1)) "$title" "$project_path" "$last_ts"
+  done
+
+  echo ""
+  echo "  Commands:  <number>        resume session"
+  echo "             d <number>      unrename (remove name, keep session)"
+  echo "             r <number>      rename to new name"
+  echo "             q               quit"
+  echo ""
+}
+
+# ── Main loop ──────────────────────────────────────────────────────────────
+main() {
+  mapfile -t lines < <(collect_sessions)
+
+  if [[ ${#lines[@]} -eq 0 ]]; then
+    echo "No renamed sessions found."
+    echo "Tip: in a Claude Code session, use the /name slash command (or rename"
+    echo "from the UI) to give a session a sticky name, then it will show up here."
+    exit 0
+  fi
+
+  show_list
+
+  while true; do
+    read -rp "  > " input
+
+    if [[ -z "$input" || "$input" == "q" ]]; then
+      exit 0
+    fi
+
+    local cmd num
+    if [[ "$input" =~ ^d[[:space:]]+([0-9]+)$ ]]; then
+      cmd="unrename"
+      num="${BASH_REMATCH[1]}"
+    elif [[ "$input" =~ ^r[[:space:]]+([0-9]+)$ ]]; then
+      cmd="rename"
+      num="${BASH_REMATCH[1]}"
+    elif [[ "$input" =~ ^([0-9]+)$ ]]; then
+      cmd="resume"
+      num="${BASH_REMATCH[1]}"
+    else
+      echo "  Invalid input."
+      continue
+    fi
+
+    if (( num < 1 || num > ${#lines[@]} )); then
+      echo "  Invalid number."
+      continue
+    fi
+
+    local idx=$((num - 1))
+    IFS=$'\t' read -r title project_path last_ts sid filepath project_dir <<< "${lines[$idx]}"
+
+    case "$cmd" in
+      resume)
+        echo ""
+        echo "  Resuming: $title ($sid)"
+        echo ""
+        cd "$project_path" 2>/dev/null || true
+        exec claude --resume "$sid"
+        ;;
+      unrename)
+        unrename_session "$filepath"
+        echo "  Removed: $title"
+        echo ""
+        mapfile -t lines < <(collect_sessions)
+        if [[ ${#lines[@]} -eq 0 ]]; then
+          echo "  No named sessions remaining."
+          exit 0
+        fi
+        show_list
+        ;;
+      rename)
+        read -rp "  New name for '$title': " new_name
+        if [[ -n "$new_name" ]]; then
+          rename_session "$filepath" "$new_name"
+          echo ""
+          mapfile -t lines < <(collect_sessions)
+          show_list
+        else
+          echo "  Cancelled."
+        fi
+        ;;
+    esac
+  done
+}
+
+main

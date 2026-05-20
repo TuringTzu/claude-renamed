@@ -1,0 +1,11 @@
+{
+  "_comment": "Copy this to ~/.config/claude-renamed/paths.json and edit. Both keys are optional.",
+
+  "prefix_maps": [
+    {"from": "/old/prefix/", "to": "/new/prefix/"}
+  ],
+
+  "exact_maps": {
+    "/old/exact/project/path": "/new/exact/project/path"
+  }
+}
