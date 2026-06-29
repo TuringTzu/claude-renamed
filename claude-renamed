@@ -135,7 +135,9 @@ for filepath in sys.stdin:
         }
 
 from datetime import datetime
-for sid, info in sorted(sessions.items(), key=lambda x: x[1]['last_ts'] or 0, reverse=True):
+# Oldest first → newest last, so the freshest session prints at the BOTTOM,
+# closest to the prompt.
+for sid, info in sorted(sessions.items(), key=lambda x: x[1]['last_ts'] or 0):
     last = datetime.fromtimestamp(info['last_ts'] / 1000).strftime('%Y-%m-%d %H:%M') if info['last_ts'] else '?'
     print(f\"{info['title']}\t{info['project_path']}\t{last}\t{sid}\t{info['filepath']}\t{info['project_dir']}\")
 "
@@ -264,8 +266,9 @@ with open(f, 'w') as fp:
 " "$sid" "$op"
 }
 
-# Reorder global `lines`: active sessions first, archived ones last. Sets the
-# global `active_count` to the number of non-archived sessions.
+# Reorder global `lines`: archived sessions first (top of screen), active ones
+# last so the newest active session sits at the bottom near the prompt. Sets the
+# global `archived_count` to the number of archived sessions.
 partition_lines() {
   local l t p ts sid fp pd
   local active=() archived=()
@@ -277,10 +280,10 @@ partition_lines() {
       active+=("$l")
     fi
   done
-  active_count=${#active[@]}
+  archived_count=${#archived[@]}
   lines=()
-  if ((${#active[@]})); then lines+=("${active[@]}"); fi
   if ((${#archived[@]})); then lines+=("${archived[@]}"); fi
+  if ((${#active[@]})); then lines+=("${active[@]}"); fi
 }
 
 # Re-scan sessions from disk and re-partition into active/archived.
@@ -291,7 +294,7 @@ refresh_lines() {
 
 # ── Display list ───────────────────────────────────────────────────────────
 show_list() {
-  local archived_count=$(( ${#lines[@]} - active_count ))
+  local active_count=$(( ${#lines[@]} - archived_count ))
   echo ""
   if (( archived_count > 0 )); then
     echo "  Claude Session Manager (${active_count} active, ${archived_count} archived)"
@@ -301,14 +304,20 @@ show_list() {
   echo "  ──────────────────────────────────────────────────"
   echo ""
 
+  # Layout: archived rows first (dimmed, under an "Archived" heading), then the
+  # active rows (under an "Active" heading) with the newest at the bottom near
+  # the prompt. Headings only appear when there is anything archived.
   for i in "${!lines[@]}"; do
-    if (( i == active_count )) && (( active_count < ${#lines[@]} )); then
-      echo ""
-      printf "  \033[2m── Archived ──────────────────────────────────────\033[0m\n"
-      echo ""
+    if (( archived_count > 0 )); then
+      if (( i == 0 )); then
+        printf "  \033[2m── Archived ──────────────────────────────────────\033[0m\n"
+      elif (( i == archived_count )); then
+        echo ""
+        printf "  \033[2m── Active ────────────────────────────────────────\033[0m\n"
+      fi
     fi
     IFS=$'\t' read -r title project_path last_ts sid filepath project_dir <<< "${lines[$i]}"
-    if (( i >= active_count )); then
+    if (( i < archived_count )); then
       # Archived rows: dimmed.
       printf "  \033[2m%2d  %-35s  %-40s  %s\033[0m\n" \
         $((i + 1)) "$title" "$project_path" "$last_ts"
@@ -322,7 +331,7 @@ show_list() {
   echo "  Commands:  <number>        resume session"
   echo "             d <number>      unrename (remove name, keep session)"
   echo "             r <number>      rename to new name"
-  echo "             a <number>      archive (sort to bottom)"
+  echo "             a <number>      archive (move to Archived)"
   echo "             ua <number>     unarchive"
   echo "             q               quit"
   echo ""
