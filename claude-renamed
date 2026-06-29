@@ -34,9 +34,19 @@ fi
 
 # ── Collect renamed sessions from JSONL files ──────────────────────────────
 collect_sessions() {
-  find "$PROJECTS_DIR" -name '*.jsonl' -not -path '*/subagents/*' -not -path '*/tool-results/*' -not -path '*/workflows/*' | \
+  # Speed: never let Python read the (often huge) transcript files. Two early-
+  # stopping greps do the I/O in C — one pulls the first custom-title line per
+  # file, the other the first cwd line — and Python only parses those small
+  # outputs. Last-activity time comes from the file mtime, not the contents.
+  #
+  # grep -H prints "FILENAME:matchline"; session paths never contain ':', so the
+  # first colon always separates filename from the JSON payload.
+  local find_args=(-name '*.jsonl' -not -path '*/subagents/*' -not -path '*/tool-results/*' -not -path '*/workflows/*')
   CLAUDE_RENAMED_CONFIG="$CONFIG_FILE" python3 -c "
 import json, sys, os
+from datetime import datetime
+
+titles_path, cwds_path = sys.argv[1], sys.argv[2]
 
 # Load optional path-remapping config
 config_file = os.environ.get('CLAUDE_RENAMED_CONFIG', '')
@@ -56,91 +66,98 @@ if config_file and os.path.exists(config_file):
     except Exception:
         pass  # silently ignore malformed config
 
+def parse_grep(path):
+    # Map filepath -> parsed JSON dict of its first matching line.
+    out = {}
+    try:
+        with open(path, errors='replace') as f:
+            for line in f:
+                fn, sep, rest = line.partition(':')
+                if not sep:
+                    continue
+                if fn in out:
+                    continue
+                try:
+                    out[fn] = json.loads(rest)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return out
+
+titles = parse_grep(titles_path)
+cwds = parse_grep(cwds_path)
+
+def last_activity_ms(fp):
+    # Real last-activity time = timestamp of the last event line. Read only the
+    # tail so this stays fast, and don't trust file mtime (rsync mirrors and
+    # other tools touch these files, which would scramble the ordering).
+    try:
+        with open(fp, 'rb') as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 8192))
+            tail = f.read().decode('utf-8', 'replace').splitlines()
+    except Exception:
+        tail = []
+    for line in reversed(tail):
+        if '\"timestamp\"' not in line:
+            continue
+        try:
+            ts = json.loads(line).get('timestamp')
+        except Exception:
+            continue
+        if not ts:
+            continue
+        if isinstance(ts, (int, float)):
+            return int(ts)
+        try:
+            return int(datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() * 1000)
+        except Exception:
+            continue
+    try:
+        return int(os.path.getmtime(fp) * 1000)  # fallback
+    except Exception:
+        return None
+
+def remap(p):
+    if p in EXACT_MAPS:
+        return EXACT_MAPS[p]
+    for old_prefix, new_prefix in PREFIX_MAPS:
+        if p == old_prefix.rstrip('/'):
+            return new_prefix.rstrip('/')
+        if p.startswith(old_prefix):
+            return new_prefix + p[len(old_prefix):]
+    return p
+
 sessions = {}
-for filepath in sys.stdin:
-    filepath = filepath.strip()
-    if not filepath:
+for filepath, td in titles.items():
+    title = td.get('customTitle')
+    if not title:
         continue
     sid = os.path.basename(filepath).replace('.jsonl', '')
-    if '/' in sid:
+    if '/' in sid or sid in sessions:
         continue
-
-    title = None
-    first_ts = None
-    last_ts = None
     project_dir = os.path.basename(os.path.dirname(filepath))
+    proj_path = (cwds.get(filepath) or {}).get('cwd') or project_dir
+    proj_path = remap(proj_path)
+    last_ts = last_activity_ms(filepath)
+    sessions[sid] = {
+        'title': title,
+        'project_dir': project_dir,
+        'project_path': proj_path,
+        'last_ts': last_ts,
+        'filepath': filepath,
+    }
 
-    try:
-        with open(filepath) as f:
-            for line in f:
-                try:
-                    d = json.loads(line)
-                except Exception:
-                    continue
-                if d.get('type') == 'custom-title' and d.get('customTitle'):
-                    title = d['customTitle']
-                ts = d.get('timestamp')
-                if ts:
-                    if isinstance(ts, str):
-                        from datetime import datetime as _dt
-                        try:
-                            ts = int(_dt.fromisoformat(ts.replace('Z','+00:00')).timestamp() * 1000)
-                        except Exception:
-                            continue
-                    if first_ts is None or ts < first_ts:
-                        first_ts = ts
-                    if last_ts is None or ts > last_ts:
-                        last_ts = ts
-    except Exception:
-        continue
-
-    if title and sid not in sessions:
-        # The project_dir encoding is lossy (all / and - become -).
-        # Try to read the actual cwd from the first user message in the session.
-        proj_path = None
-        try:
-            with open(filepath) as f2:
-                for line2 in f2:
-                    try:
-                        d2 = json.loads(line2)
-                        if d2.get('type') == 'user' and d2.get('cwd'):
-                            proj_path = d2['cwd']
-                            break
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-        if not proj_path:
-            proj_path = project_dir
-
-        # Apply optional remapping
-        if proj_path in EXACT_MAPS:
-            proj_path = EXACT_MAPS[proj_path]
-        else:
-            for old_prefix, new_prefix in PREFIX_MAPS:
-                if proj_path == old_prefix.rstrip('/'):
-                    proj_path = new_prefix.rstrip('/')
-                    break
-                if proj_path.startswith(old_prefix):
-                    proj_path = new_prefix + proj_path[len(old_prefix):]
-                    break
-
-        sessions[sid] = {
-            'title': title,
-            'project_dir': project_dir,
-            'project_path': proj_path,
-            'first_ts': first_ts,
-            'last_ts': last_ts,
-            'filepath': filepath,
-        }
-
-from datetime import datetime
 # Oldest first → newest last, so the freshest session prints at the BOTTOM,
 # closest to the prompt.
 for sid, info in sorted(sessions.items(), key=lambda x: x[1]['last_ts'] or 0):
     last = datetime.fromtimestamp(info['last_ts'] / 1000).strftime('%Y-%m-%d %H:%M') if info['last_ts'] else '?'
     print(f\"{info['title']}\t{info['project_path']}\t{last}\t{sid}\t{info['filepath']}\t{info['project_dir']}\")
-"
+" \
+    <(find "$PROJECTS_DIR" "${find_args[@]}" -print0 | xargs -0 grep -m1 -HF '"type":"custom-title"' 2>/dev/null) \
+    <(find "$PROJECTS_DIR" "${find_args[@]}" -print0 | xargs -0 grep -m1 -HF '"cwd"' 2>/dev/null)
 }
 
 # ── Remove custom-title lines from a session JSONL ────────────────────────
@@ -222,22 +239,33 @@ print(f'Renamed to: {new_name}')
 # Archive state is kept separately from the session JSONL files so it never
 # touches Claude Code's own data. The file is a JSON object: {"archived": [sid…]}.
 
-# Returns 0 if the given session id is archived, 1 otherwise.
-is_archived() {
-  local sid="$1"
-  [[ -f "$ARCHIVE_FILE" ]] || return 1
-  ARCHIVE_FILE="$ARCHIVE_FILE" python3 -c "
-import json, os, sys
-sid = sys.argv[1]
+# Archived session ids, loaded once into memory so per-session lookups don't
+# each spawn a Python process (that made refreshing the list painfully slow).
+declare -A ARCHIVED
+
+# Read archived.json once into the ARCHIVED associative array.
+load_archived() {
+  ARCHIVED=()
+  [[ -f "$ARCHIVE_FILE" ]] || return 0
+  local sid
+  while IFS= read -r sid; do
+    [[ -n "$sid" ]] && ARCHIVED["$sid"]=1
+  done < <(ARCHIVE_FILE="$ARCHIVE_FILE" python3 -c "
+import json, os
 f = os.environ['ARCHIVE_FILE']
 try:
     with open(f) as fp:
         data = json.load(fp)
-    ids = set(data.get('archived', []) if isinstance(data, dict) else data)
+    ids = data.get('archived', []) if isinstance(data, dict) else data
 except Exception:
-    ids = set()
-sys.exit(0 if sid in ids else 1)
-" "$sid"
+    ids = []
+print('\n'.join(str(i) for i in ids))
+")
+}
+
+# Returns 0 if the given session id is archived, 1 otherwise (pure in-memory).
+is_archived() {
+  [[ -n "${ARCHIVED[$1]:-}" ]]
 }
 
 # Add ('add') or remove ('remove') a session id from the archive store.
@@ -288,6 +316,7 @@ partition_lines() {
 
 # Re-scan sessions from disk and re-partition into active/archived.
 refresh_lines() {
+  load_archived
   mapfile -t lines < <(collect_sessions)
   partition_lines
 }
