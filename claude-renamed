@@ -316,14 +316,17 @@ show_list() {
         printf "  \033[2m── Active ────────────────────────────────────────\033[0m\n"
       fi
     fi
+    # Number from the bottom up: the newest (bottom) row is #1, increasing as you
+    # go up. So the most-likely-to-resume session is always #1, next to the prompt.
+    local label=$(( ${#lines[@]} - i ))
     IFS=$'\t' read -r title project_path last_ts sid filepath project_dir <<< "${lines[$i]}"
     if (( i < archived_count )); then
       # Archived rows: dimmed.
-      printf "  \033[2m%2d  %-35s  %-40s  %s\033[0m\n" \
-        $((i + 1)) "$title" "$project_path" "$last_ts"
+      printf "  \033[2m%3d  %-35s  %-40s  %s\033[0m\n" \
+        "$label" "$title" "$project_path" "$last_ts"
     else
-      printf "  \033[1;36m%2d\033[0m  \033[1m%-35s\033[0m  \033[2m%-40s  %s\033[0m\n" \
-        $((i + 1)) "$title" "$project_path" "$last_ts"
+      printf "  \033[1;36m%3d\033[0m  \033[1m%-35s\033[0m  \033[2m%-40s  %s\033[0m\n" \
+        "$label" "$title" "$project_path" "$last_ts"
     fi
   done
 
@@ -383,7 +386,8 @@ main() {
       continue
     fi
 
-    local idx=$((num - 1))
+    # Numbers count from the bottom (newest = 1), so invert to get the array index.
+    local idx=$(( ${#lines[@]} - num ))
     IFS=$'\t' read -r title project_path last_ts sid filepath project_dir <<< "${lines[$idx]}"
 
     case "$cmd" in

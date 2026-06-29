@@ -9,12 +9,12 @@ Claude Code lets you give a session a sticky custom title (via `/name` or the re
   ──────────────────────────────────────────────────
 
   ── Archived ──────────────────────────────────────
-   1  old-spike                          /home/me/code/api                 2026-04-02 11:10
+   4  old-spike                          /home/me/code/api                 2026-04-02 11:10
 
   ── Active ────────────────────────────────────────
-   2  vacation-trip-planner              /home/me/personal                 2026-05-19 20:33
-   3  refactor-auth                      /home/me/code/api                 2026-05-20 15:21
-   4  lovereport                         /home/me/code/lovereport          2026-05-20 15:22
+   3  vacation-trip-planner              /home/me/personal                 2026-05-19 20:33
+   2  refactor-auth                      /home/me/code/api                 2026-05-20 15:21
+   1  lovereport                         /home/me/code/lovereport          2026-05-20 15:22
 
   Commands:  <number>        resume session
              d <number>      unrename (remove name, keep session)
@@ -52,7 +52,7 @@ Claude Code stores each session's transcript as JSONL under `~/.claude/projects/
 {"type":"custom-title","customTitle":"refactor-auth","timestamp":...}
 ```
 
-`claude-renamed` scans every JSONL, keeps the sessions that have a `custom-title` entry, and presents them oldest-first so the most-recently-active session sits at the bottom, right next to the prompt. Resume re-execs `claude --resume <session-id>` in that session's original working directory. Rename and unrename atomically rewrite the JSONL.
+`claude-renamed` scans every JSONL, keeps the sessions that have a `custom-title` entry, and presents them oldest-first so the most-recently-active session sits at the bottom, right next to the prompt — numbered from the bottom up, so the newest session is always **#1**. Resume re-execs `claude --resume <session-id>` in that session's original working directory. Rename and unrename atomically rewrite the JSONL.
 
 Nothing here is "official" — it just reads the on-disk format that Claude Code already writes. Should the format ever change, this script will need a small patch.
 
