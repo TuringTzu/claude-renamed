@@ -24,6 +24,7 @@ set -euo pipefail
 
 PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 CONFIG_FILE="${CLAUDE_RENAMED_CONFIG:-$HOME/.config/claude-renamed/paths.json}"
+ARCHIVE_FILE="${CLAUDE_RENAMED_ARCHIVE:-$HOME/.config/claude-renamed/archived.json}"
 
 if [[ ! -d "$PROJECTS_DIR" ]]; then
   echo "No projects directory found at $PROJECTS_DIR"
@@ -215,30 +216,121 @@ print(f'Renamed to: {new_name}')
 " "$filepath" "$new_name"
 }
 
+# ── Archive store (~/.config/claude-renamed/archived.json) ────────────────
+# Archive state is kept separately from the session JSONL files so it never
+# touches Claude Code's own data. The file is a JSON object: {"archived": [sid…]}.
+
+# Returns 0 if the given session id is archived, 1 otherwise.
+is_archived() {
+  local sid="$1"
+  [[ -f "$ARCHIVE_FILE" ]] || return 1
+  ARCHIVE_FILE="$ARCHIVE_FILE" python3 -c "
+import json, os, sys
+sid = sys.argv[1]
+f = os.environ['ARCHIVE_FILE']
+try:
+    with open(f) as fp:
+        data = json.load(fp)
+    ids = set(data.get('archived', []) if isinstance(data, dict) else data)
+except Exception:
+    ids = set()
+sys.exit(0 if sid in ids else 1)
+" "$sid"
+}
+
+# Add ('add') or remove ('remove') a session id from the archive store.
+set_archive() {
+  local sid="$1" op="$2"
+  mkdir -p "$(dirname "$ARCHIVE_FILE")"
+  ARCHIVE_FILE="$ARCHIVE_FILE" python3 -c "
+import json, os, sys
+sid, op = sys.argv[1], sys.argv[2]
+f = os.environ['ARCHIVE_FILE']
+ids = []
+if os.path.exists(f):
+    try:
+        with open(f) as fp:
+            data = json.load(fp)
+        ids = list(data.get('archived', []) if isinstance(data, dict) else data)
+    except Exception:
+        ids = []
+s = set(ids)
+if op == 'add':
+    s.add(sid)
+else:
+    s.discard(sid)
+with open(f, 'w') as fp:
+    json.dump({'archived': sorted(s)}, fp, indent=2)
+" "$sid" "$op"
+}
+
+# Reorder global `lines`: active sessions first, archived ones last. Sets the
+# global `active_count` to the number of non-archived sessions.
+partition_lines() {
+  local l t p ts sid fp pd
+  local active=() archived=()
+  for l in "${lines[@]}"; do
+    IFS=$'\t' read -r t p ts sid fp pd <<< "$l"
+    if is_archived "$sid"; then
+      archived+=("$l")
+    else
+      active+=("$l")
+    fi
+  done
+  active_count=${#active[@]}
+  lines=()
+  if ((${#active[@]})); then lines+=("${active[@]}"); fi
+  if ((${#archived[@]})); then lines+=("${archived[@]}"); fi
+}
+
+# Re-scan sessions from disk and re-partition into active/archived.
+refresh_lines() {
+  mapfile -t lines < <(collect_sessions)
+  partition_lines
+}
+
 # ── Display list ───────────────────────────────────────────────────────────
 show_list() {
+  local archived_count=$(( ${#lines[@]} - active_count ))
   echo ""
-  echo "  Claude Session Manager (${#lines[@]} named sessions)"
+  if (( archived_count > 0 )); then
+    echo "  Claude Session Manager (${active_count} active, ${archived_count} archived)"
+  else
+    echo "  Claude Session Manager (${#lines[@]} named sessions)"
+  fi
   echo "  ──────────────────────────────────────────────────"
   echo ""
 
   for i in "${!lines[@]}"; do
+    if (( i == active_count )) && (( active_count < ${#lines[@]} )); then
+      echo ""
+      printf "  \033[2m── Archived ──────────────────────────────────────\033[0m\n"
+      echo ""
+    fi
     IFS=$'\t' read -r title project_path last_ts sid filepath project_dir <<< "${lines[$i]}"
-    printf "  \033[1;36m%2d\033[0m  \033[1m%-35s\033[0m  \033[2m%-40s  %s\033[0m\n" \
-      $((i + 1)) "$title" "$project_path" "$last_ts"
+    if (( i >= active_count )); then
+      # Archived rows: dimmed.
+      printf "  \033[2m%2d  %-35s  %-40s  %s\033[0m\n" \
+        $((i + 1)) "$title" "$project_path" "$last_ts"
+    else
+      printf "  \033[1;36m%2d\033[0m  \033[1m%-35s\033[0m  \033[2m%-40s  %s\033[0m\n" \
+        $((i + 1)) "$title" "$project_path" "$last_ts"
+    fi
   done
 
   echo ""
   echo "  Commands:  <number>        resume session"
   echo "             d <number>      unrename (remove name, keep session)"
   echo "             r <number>      rename to new name"
+  echo "             a <number>      archive (sort to bottom)"
+  echo "             ua <number>     unarchive"
   echo "             q               quit"
   echo ""
 }
 
 # ── Main loop ──────────────────────────────────────────────────────────────
 main() {
-  mapfile -t lines < <(collect_sessions)
+  refresh_lines
 
   if [[ ${#lines[@]} -eq 0 ]]; then
     echo "No renamed sessions found."
@@ -257,7 +349,13 @@ main() {
     fi
 
     local cmd num
-    if [[ "$input" =~ ^d[[:space:]]+([0-9]+)$ ]]; then
+    if [[ "$input" =~ ^ua[[:space:]]+([0-9]+)$ ]]; then
+      cmd="unarchive"
+      num="${BASH_REMATCH[1]}"
+    elif [[ "$input" =~ ^a[[:space:]]+([0-9]+)$ ]]; then
+      cmd="archive"
+      num="${BASH_REMATCH[1]}"
+    elif [[ "$input" =~ ^d[[:space:]]+([0-9]+)$ ]]; then
       cmd="unrename"
       num="${BASH_REMATCH[1]}"
     elif [[ "$input" =~ ^r[[:space:]]+([0-9]+)$ ]]; then
@@ -291,7 +389,7 @@ main() {
         unrename_session "$filepath"
         echo "  Removed: $title"
         echo ""
-        mapfile -t lines < <(collect_sessions)
+        refresh_lines
         if [[ ${#lines[@]} -eq 0 ]]; then
           echo "  No named sessions remaining."
           exit 0
@@ -303,11 +401,25 @@ main() {
         if [[ -n "$new_name" ]]; then
           rename_session "$filepath" "$new_name"
           echo ""
-          mapfile -t lines < <(collect_sessions)
+          refresh_lines
           show_list
         else
           echo "  Cancelled."
         fi
+        ;;
+      archive)
+        set_archive "$sid" add
+        echo "  Archived: $title"
+        echo ""
+        refresh_lines
+        show_list
+        ;;
+      unarchive)
+        set_archive "$sid" remove
+        echo "  Unarchived: $title"
+        echo ""
+        refresh_lines
+        show_list
         ;;
     esac
   done

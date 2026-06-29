@@ -1,6 +1,6 @@
 # claude-renamed
 
-A tiny Bash CLI to **list, resume, rename, and unrename your Claude Code sessions** — from one screen.
+A tiny Bash CLI to **list, resume, rename, unrename, and archive your Claude Code sessions** — from one screen.
 
 Claude Code lets you give a session a sticky custom title (via `/name` or the rename UI), but there's no first-class way to browse those named sessions across all your projects, jump back into one, or change/clear a name after the fact. `claude-renamed` does exactly that.
 
@@ -13,9 +13,15 @@ Claude Code lets you give a session a sticky custom title (via `/name` or the re
    3  vacation-trip-planner              /home/me/personal                 2026-05-19 20:33
    ...
 
+  ── Archived ──────────────────────────────────────
+
+   4  old-spike                          /home/me/code/api                 2026-04-02 11:10
+
   Commands:  <number>        resume session
              d <number>      unrename (remove name, keep session)
              r <number>      rename to new name
+             a <number>      archive (sort to bottom)
+             ua <number>     unarchive
              q               quit
 ```
 
@@ -51,6 +57,18 @@ Claude Code stores each session's transcript as JSONL under `~/.claude/projects/
 
 Nothing here is "official" — it just reads the on-disk format that Claude Code already writes. Should the format ever change, this script will need a small patch.
 
+## Archiving
+
+`a <number>` archives a session and `ua <number>` un-archives it. Archived sessions aren't deleted — they're sorted to the bottom of the list under an **Archived** heading (dimmed), so your active sessions stay at the top. Everything still works on them by number (resume, rename, unrename).
+
+Unlike rename, archive state is **not** written into the session JSONL. It's kept in a small separate file, `~/.config/claude-renamed/archived.json`:
+
+```json
+{ "archived": ["<session-id>", "<session-id>"] }
+```
+
+This keeps Claude Code's own session files untouched. Override the location with `CLAUDE_RENAMED_ARCHIVE=...`.
+
 ## Optional: path remapping
 
 If you've moved your code between machines (e.g. an old Linux box where projects lived at `/srv/code/` and a new Mac where they live at `/Volumes/ssd/srv/code/`), Claude Code remembers the original `cwd`. Resume would `cd` into a path that no longer exists.
@@ -79,6 +97,7 @@ You can also point at a different config file via `CLAUDE_RENAMED_CONFIG=...`, o
 |-----|---------|------|
 | `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | Where to scan for session JSONL files. |
 | `CLAUDE_RENAMED_CONFIG` | `~/.config/claude-renamed/paths.json` | Path-remapping config (optional). |
+| `CLAUDE_RENAMED_ARCHIVE` | `~/.config/claude-renamed/archived.json` | Where archived session ids are stored. |
 
 ## Caveats
 
